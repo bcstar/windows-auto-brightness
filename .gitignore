@@ -1,0 +1,11 @@
+# Ignore everything except what we explicitly want
+*
+*/
+!/auto-brightness.py
+!/camera.py
+!/brightness_calib.json
+!/.gitignore
+!/README.md
+
+# But allow specific dirs ONLY when files inside are explicitly tracked
+!/netsec-agent/

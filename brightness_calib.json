@@ -1,0 +1,41 @@
+{
+  "timestamp": "2026-06-04T06:21:11.683977",
+  "samples": [
+    {
+      "env": 72.9,
+      "screen": 56
+    },
+    {
+      "env": 8.1,
+      "screen": 39
+    },
+    {
+      "env": 6.4,
+      "screen": 23
+    },
+    {
+      "env": 11.4,
+      "screen": 37
+    },
+    {
+      "env": 76.6,
+      "screen": 59
+    },
+    {
+      "env": 0.5,
+      "screen": 24
+    },
+    {
+      "env": 78.4,
+      "screen": 58
+    }
+  ],
+  "recommended": {
+    "min_screen": 23,
+    "max_screen": 59,
+    "env_range": [
+      0.5,
+      78.4
+    ]
+  }
+}
