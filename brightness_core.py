@@ -9,6 +9,7 @@ import cv2
 import time
 import os
 import json
+import threading
 import numpy as np
 from datetime import datetime
 
@@ -207,6 +208,77 @@ def capture_one_frame(cap):
             return frame
         time.sleep(0.1)
     return None
+
+
+class CameraManager:
+    """全局摄像头管理器——应用启动时开启，持续采集最新帧，所有人读缓存。
+
+    解决了：
+    - 每次打开摄像头 1.5s 的延迟（只开一次）
+    - 多个模块各自开摄像头打架的问题
+    """
+
+    def __init__(self, index=0):
+        self.index = index
+        self._cap = None
+        self._lock = threading.Lock()
+        self._latest_frame = None
+        self._running = False
+        self._thread = None
+        self._error = None
+
+    def start(self):
+        """在后台线程打开摄像头并持续采集"""
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        self._cap = open_camera(self.index)
+        if not self._cap or not self._cap.isOpened():
+            self._error = "无法打开摄像头"
+            return
+
+        for _ in range(10):
+            self._cap.read()
+        time.sleep(0.3)
+
+        while self._running:
+            ret, frame = self._cap.read()
+            if ret:
+                with self._lock:
+                    self._latest_frame = frame
+
+        if self._cap:
+            self._cap.release()
+
+    def get_frame(self):
+        """获取最新一帧（线程安全），返回 frame 副本或 None"""
+        with self._lock:
+            if self._latest_frame is None:
+                return None
+            return self._latest_frame.copy()
+
+    def get_light_level(self):
+        """获取当前环境光强度"""
+        frame = self.get_frame()
+        if frame is not None:
+            return get_frame_light(frame)
+        return None
+
+    @property
+    def is_ready(self):
+        return self._latest_frame is not None and self._error is None
+
+    @property
+    def error(self):
+        return self._error
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._latest_frame = None
 
 
 def compute_brightness_adjustment(env_light, samples):
