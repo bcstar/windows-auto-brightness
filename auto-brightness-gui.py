@@ -289,7 +289,9 @@ class CalibrationWindow(tk.Toplevel):
         super().__init__(parent)
         self.parent = parent
         self.camera_index = camera_index
-        self.samples = []
+        # 加载已有校准数据作为起点（累计，不覆盖）
+        calib = load_calibration()
+        self.samples = [(s["env"], s["screen"]) for s in calib["samples"]] if calib else []
         self.cap = None
         self._running = True
 
@@ -392,6 +394,9 @@ class CalibrationWindow(tk.Toplevel):
         self.bind("<space>", lambda e: self.record_sample())
         self.bind("<Escape>", lambda e: self.save_and_close())
 
+        # 在列表框中显示已有样本
+        self._populate_samples_list()
+
         # 启动摄像头
         self.start_camera()
         self.after(100, self.poll_camera)
@@ -436,6 +441,15 @@ class CalibrationWindow(tk.Toplevel):
                 self.redraw_curve()
 
         self.after(150, self.poll_camera)
+
+    def _populate_samples_list(self):
+        """在列表框中显示已有样本"""
+        for i, (env, scr) in enumerate(self.samples):
+            self.samples_listbox.insert(
+                tk.END,
+                f"  #{i+1:2d}  "
+                f"环境光 {env:6.1f}  →  屏幕 {scr:3d}%")
+        self.info_records_var.set(f"已记录: {len(self.samples)} 个样本")
 
     def record_sample(self):
         if not self._running or not self.cap:
