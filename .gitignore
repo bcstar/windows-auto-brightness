@@ -2,7 +2,9 @@
 *
 */
 !/auto-brightness.py
+!/auto-brightness-gui.py
 !/camera.py
+!/brightness_core.py
 !/brightness_calib.json
 !/.gitignore
 !/README.md
