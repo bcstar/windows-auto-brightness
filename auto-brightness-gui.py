@@ -21,11 +21,10 @@ from PIL import Image, ImageTk
 
 from brightness_core import (
     DEFAULT_INTERVAL, FAST_INTERVAL, CHANGE_THRESHOLD, DEADBAND,
-    LightAverager, load_calibration, save_calibration,
+    LightAverager, CameraManager, load_calibration, save_calibration,
     get_calibration_samples, interpolate_brightness,
     get_current_brightness, set_brightness,
-    get_frame_light, open_camera, capture_one_frame,
-    CALIB_FILE,
+    get_frame_light, CALIB_FILE,
 )
 
 # ============ 图标/表情常量 ============
@@ -40,12 +39,12 @@ ICON_RECORD = "●"
 
 # ============ 工作线程 ============
 class BrightnessWorker(threading.Thread):
-    """后台摄像头采集 + 亮度计算 + 自动调节"""
+    """后台亮度调节——从 CameraManager 读环境光，不自己开摄像头"""
 
-    def __init__(self, camera_index=0, interval=DEFAULT_INTERVAL,
+    def __init__(self, cam, interval=DEFAULT_INTERVAL,
                  fast=False, samples=None, enable_camera_preview=True):
         super().__init__(daemon=True)
-        self.camera_index = camera_index
+        self.cam = cam
         self.interval = FAST_INTERVAL if fast else interval
         self.samples = samples or [(5, 20), (50, 60), (90, 100)]
         self.enable_preview = enable_camera_preview
@@ -55,109 +54,88 @@ class BrightnessWorker(threading.Thread):
         self.preview_queue = queue.Queue(maxsize=3)
 
         self.averager = LightAverager()
-        self.cap = None
 
     def run(self):
-        # 初始化 COM 以便在工作线程中使用 WMI
         try:
             import pythoncom
             pythoncom.CoInitialize()
         except ImportError:
             pass
 
-        self.cap = open_camera(self.camera_index)
-        if not self.cap or not self.cap.isOpened():
-            self.data_queue.put({"type": "error", "msg": "无法打开摄像头"})
+        # 等 CameraManager 就绪（最多等 5s）
+        for _ in range(50):
+            if self.cam.is_ready or self.cam.error:
+                break
+            time.sleep(0.1)
+
+        if self.cam.error:
+            self.data_queue.put({"type": "error", "msg": self.cam.error})
             return
 
-        # 预热
-        for _ in range(10):
-            self.cap.read()
-        time.sleep(0.3)
+        self.data_queue.put({"type": "started"})
 
         last_env = None
         last_set_at = time.time()
         last_frame_time = time.time()
 
-        # 通知 UI 更新状态
-        self.data_queue.put({"type": "started"})
-
         while not self._stop_event.is_set():
-            frame = capture_one_frame(self.cap)
-            if frame is None:
-                time.sleep(0.1)
-                continue
-
-            # 计算环境光
-            env_light = get_frame_light(frame)
-            self.averager.add(env_light)
-            avg = self.averager.value
-
+            env_light = self.cam.get_light_level()
             now = time.time()
 
-            if self.averager.is_warm and avg is not None:
-                target = interpolate_brightness(avg, self.samples)
-                current = get_current_brightness()
+            if env_light is not None:
+                self.averager.add(env_light)
+                avg = self.averager.value
 
-                # 突变检测
-                rapid = (last_env is not None
-                         and abs(avg - last_env) >= CHANGE_THRESHOLD)
+                if self.averager.is_warm and avg is not None:
+                    target = interpolate_brightness(avg, self.samples)
+                    current = get_current_brightness()
 
-                elapsed = now - last_set_at
-                should = False
-                if elapsed >= self.interval:
-                    should = True
-                elif rapid and elapsed >= 1:
-                    should = True
+                    rapid = (last_env is not None
+                             and abs(avg - last_env) >= CHANGE_THRESHOLD)
+                    elapsed = now - last_set_at
+                    should = elapsed >= self.interval or (rapid and elapsed >= 1)
 
-                if should:
-                    if current is None or abs(target - current) >= DEADBAND:
-                        set_brightness(target)
-                        reason = "突变" if rapid else "定时"
-                        self.data_queue.put({
-                            "type": "adjust",
+                    if should:
+                        if current is None or abs(target - current) >= DEADBAND:
+                            set_brightness(target)
+                            reason = "突变" if rapid else "定时"
+                            self.data_queue.put({
+                                "type": "adjust",
+                                "time": now,
+                                "env_light": round(avg, 1),
+                                "target": target,
+                                "current_before": current,
+                                "reason": reason,
+                            })
+                            last_set_at = now
+
+                    last_env = avg
+
+                    try:
+                        self.data_queue.put_nowait({
+                            "type": "data",
                             "time": now,
                             "env_light": round(avg, 1),
                             "target": target,
-                            "current_before": current,
-                            "reason": reason,
+                            "current": current or 0,
+                            "is_warm": True,
                         })
-                        last_set_at = now
+                    except queue.Full:
+                        pass
 
-                last_env = avg
+            # 预览帧（从 CameraManager 读缓存，5fps）
+            if self.enable_preview and now - last_frame_time > 0.2:
+                frame = self.cam.get_frame()
+                if frame is not None:
+                    last_frame_time = now
+                    small = cv2_resize_for_gui(frame, 320)
+                    try:
+                        self.preview_queue.put_nowait(small)
+                    except queue.Full:
+                        pass
 
-                # 实时数据推送
-                try:
-                    self.data_queue.put_nowait({
-                        "type": "data",
-                        "time": now,
-                        "env_light": round(avg, 1),
-                        "target": target,
-                        "current": current or 0,
-                        "is_warm": True,
-                    })
-                except queue.Full:
-                    pass
+            time.sleep(0.1)
 
-            # 预览帧（降帧率）
-            now_f = time.time()
-            if self.enable_preview and now_f - last_frame_time > 0.2:  # 5fps
-                last_frame_time = now_f
-                small = cv2_resize_for_gui(frame, 320)
-                try:
-                    self.preview_queue.put_nowait(small)
-                except queue.Full:
-                    pass
-
-            # 休眠分段检测（PS 时代睡 500ms，现在 COM 瞬发可缩到 100ms）
-            for _ in range(2):
-                if self._stop_event.is_set():
-                    break
-                time.sleep(0.05)
-
-        # 清理
-        if self.cap:
-            self.cap.release()
         self.data_queue.put({"type": "stopped"})
 
     def stop(self):
@@ -290,16 +268,14 @@ def draw_calibration_curve(canvas, samples, width, height,
 
 # ============ 校准窗口 ============
 class CalibrationWindow(tk.Toplevel):
-    """GUI 校准窗口——替代 OpenCV 窗口的校准体验"""
+    """GUI 校准窗口——从 CameraManager 读帧，不自开摄像头"""
 
-    def __init__(self, app, camera_index=0):
+    def __init__(self, app, cam):
         super().__init__(app.root)
         self.app = app
-        self.camera_index = camera_index
-        # 加载已有校准数据作为起点（累计，不覆盖）
+        self.cam = cam
         calib = load_calibration()
         self.samples = [(s["env"], s["screen"]) for s in calib["samples"]] if calib else []
-        self.cap = None
         self._running = True
 
         self.title("校准模式 — 自动亮度")
@@ -309,7 +285,6 @@ class CalibrationWindow(tk.Toplevel):
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # 布局框架
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -332,25 +307,23 @@ class CalibrationWindow(tk.Toplevel):
         mid_frame = ttk.Frame(main_frame)
         mid_frame.pack(fill=tk.BOTH, expand=True, pady=4)
 
-        # 摄像头预览
         preview_frame = ttk.LabelFrame(mid_frame, text="摄像头预览", padding=4)
         preview_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
 
-        self.preview_label = ttk.Label(preview_frame, background="#222")
+        self.preview_label = ttk.Label(preview_frame, background="#222",
+                                       text="⏳ 等待摄像头就绪...")
         self.preview_label.pack(fill=tk.BOTH, expand=True)
 
-        # 曲线面板
         curve_frame = ttk.LabelFrame(mid_frame, text="校准曲线", padding=4)
         curve_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
 
         self.curve_canvas = tk.Canvas(curve_frame, bg="white", height=260)
         self.curve_canvas.pack(fill=tk.BOTH, expand=True)
 
-        # === 底部：操作按钮 + 样本列表 ===
+        # === 底部 ===
         bottom_frame = ttk.Frame(main_frame)
         bottom_frame.pack(fill=tk.X, pady=(8, 0))
 
-        # 按钮
         btn_frame = ttk.Frame(bottom_frame)
         btn_frame.pack(fill=tk.X, pady=(0, 6))
 
@@ -358,136 +331,74 @@ class CalibrationWindow(tk.Toplevel):
             btn_frame, text=f"{ICON_RECORD} 记录当前 (SPACE)",
             command=self.record_sample, width=18)
         self.btn_record.pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(
-            btn_frame, text="删除最后一个",
-            command=self.delete_last, width=14).pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(
-            btn_frame, text="清空所有",
-            command=self.clear_all, width=10).pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(
-            btn_frame, text="✓ 完成并保存",
-            command=self.save_and_close, width=14).pack(side=tk.RIGHT, padx=2)
-
-        self.btn_save = ttk.Button(
-            btn_frame, text="保存但不退出",
-            command=self.save_only, width=14)
+        ttk.Button(btn_frame, text="删除最后一个",
+                   command=self.delete_last, width=14).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="清空所有",
+                   command=self.clear_all, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="✓ 完成并保存",
+                   command=self.save_and_close, width=14).pack(side=tk.RIGHT, padx=2)
+        self.btn_save = ttk.Button(btn_frame, text="保存但不退出",
+                                   command=self.save_only, width=14)
         self.btn_save.pack(side=tk.RIGHT, padx=2)
 
-        # 样本列表 + 提示
         list_frame = ttk.Frame(bottom_frame)
         list_frame.pack(fill=tk.X)
-
-        self.samples_listbox = tk.Listbox(
-            list_frame, height=5, font=("Consolas", 10))
+        self.samples_listbox = tk.Listbox(list_frame, height=5, font=("Consolas", 10))
         self.samples_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
                                   command=self.samples_listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.samples_listbox.config(yscrollcommand=scrollbar.set)
 
-        # 提示文本
         tip_frame = ttk.Frame(main_frame)
         tip_frame.pack(fill=tk.X, pady=(4, 0))
-        tip_text = ("提示：调好屏幕亮度 → 按「记录」或空格键 → "
-                    "换光线环境再调再记 → 至少记录 3-5 个不同场景")
-        ttk.Label(tip_frame, text=tip_text, foreground="#666",
-                  font=("Segoe UI", 9)).pack()
+        ttk.Label(tip_frame, text=("提示：调好屏幕亮度 → 按「记录」或空格键 → "
+                    "换光线环境再调再记 → 至少记录 3-5 个不同场景"),
+                  foreground="#666", font=("Segoe UI", 9)).pack()
 
-        # 绑定快捷键
         self.bind("<space>", lambda e: self.record_sample())
         self.bind("<Escape>", lambda e: self.save_and_close())
-
-        # 在列表框中显示已有样本
         self._populate_samples_list()
 
-        # 异步打开摄像头（不阻塞 UI 线程）
-        self.after(100, self._init_camera_async)
+        # 直接从 CameraManager 读数，无需开摄像头
+        self.after(200, self.poll_camera)
         self.after(500, self.redraw_curve)
-
-    def _init_camera_async(self):
-        """在后台线程打开摄像头，初始化完成后切回主线程"""
-        import threading
-
-        self.preview_label.config(text="⏳ 正在打开摄像头...")
-
-        def _open():
-            try:
-                cap = open_camera(self.camera_index)
-                if cap and cap.isOpened():
-                    for _ in range(10):
-                        cap.read()
-                    time.sleep(0.3)
-                    self.after(0, lambda: self._on_camera_ready(cap))
-                else:
-                    self.after(0, lambda: self._on_camera_failed())
-            except Exception as e:
-                self.after(0, lambda: self._on_camera_failed(str(e)))
-
-        threading.Thread(target=_open, daemon=True).start()
-
-    def _on_camera_ready(self, cap):
-        """摄像头已就绪，启动采集循环"""
-        if not self._running:
-            cap.release()
-            return
-        self.cap = cap
-        self.after(150, self.poll_camera)
-
-    def _on_camera_failed(self, msg=""):
-        """摄像头打开失败"""
-        self._running = False
-        if not self.winfo_exists():
-            return
-        self.preview_label.config(text="❌ 无法打开摄像头")
-        messagebox.showerror("错误", f"无法打开摄像头\n{msg}")
 
     def poll_camera(self):
         if not self._running:
             return
-        if self.cap and self.cap.isOpened():
-            frame = capture_one_frame(self.cap)
-            if frame is not None:
-                env_light = get_frame_light(frame)
-                screen = get_current_brightness()
+        frame = self.cam.get_frame()
+        if frame is not None:
+            env_light = get_frame_light(frame)
+            screen = get_current_brightness()
 
-                # 更新信息
-                self.info_env_var.set(f"环境光: {env_light:.1f}/100")
-                self.info_screen_var.set(
-                    f"屏幕亮度: {screen}%" if screen else "屏幕亮度: N/A")
-                self.info_records_var.set(
-                    f"已记录: {len(self.samples)} 个样本")
+            self.info_env_var.set(f"环境光: {env_light:.1f}/100")
+            self.info_screen_var.set(
+                f"屏幕亮度: {screen}%" if screen else "屏幕亮度: N/A")
+            self.info_records_var.set(f"已记录: {len(self.samples)} 个样本")
 
-                # 更新预览
-                small = cv2_resize_for_gui(frame, 300)
-                img = Image.fromarray(small)
-                imgtk = ImageTk.PhotoImage(img)
-                self.preview_label.config(image=imgtk)
-                self.preview_label.image = imgtk
+            small = cv2_resize_for_gui(frame, 300)
+            img = Image.fromarray(small)
+            imgtk = ImageTk.PhotoImage(img)
+            self.preview_label.config(image=imgtk)
+            self.preview_label.image = imgtk
 
-                # 更新曲线上的当前点
-                self._current_env = env_light
-                self._current_screen = screen
-                self.redraw_curve()
+            self._current_env = env_light
+            self._current_screen = screen
+            self.redraw_curve()
 
         self.after(150, self.poll_camera)
 
     def _populate_samples_list(self):
-        """在列表框中显示已有样本"""
         for i, (env, scr) in enumerate(self.samples):
             self.samples_listbox.insert(
-                tk.END,
-                f"  #{i+1:2d}  "
-                f"环境光 {env:6.1f}  →  屏幕 {scr:3d}%")
+                tk.END, f"  #{i+1:2d}  环境光 {env:6.1f}  →  屏幕 {scr:3d}%")
         self.info_records_var.set(f"已记录: {len(self.samples)} 个样本")
 
     def record_sample(self):
-        if not self._running or not self.cap:
+        if not self._running:
             return
-        frame = capture_one_frame(self.cap)
+        frame = self.cam.get_frame()
         if frame is None:
             return
         env = get_frame_light(frame)
@@ -495,12 +406,9 @@ class CalibrationWindow(tk.Toplevel):
         if screen is None:
             messagebox.showwarning("无法记录", "无法读取当前屏幕亮度，请重试")
             return
-
         self.samples.append((round(env, 1), screen))
         self.samples_listbox.insert(
-            tk.END,
-            f"  #{len(self.samples):2d}  "
-            f"环境光 {env:6.1f}  →  屏幕 {screen:3d}%")
+            tk.END, f"  #{len(self.samples):2d}  环境光 {env:6.1f}  →  屏幕 {screen:3d}%")
         self.samples_listbox.see(tk.END)
         self.redraw_curve()
         self.info_records_var.set(f"已记录: {len(self.samples)} 个样本")
@@ -521,12 +429,10 @@ class CalibrationWindow(tk.Toplevel):
 
     def save_only(self):
         if len(self.samples) < 2:
-            messagebox.showwarning("样本不足",
-                                   "至少需要 2 个校准样本才能保存。")
+            messagebox.showwarning("样本不足", "至少需要 2 个校准样本才能保存。")
             return
         save_calibration(self.samples)
-        messagebox.showinfo("已保存",
-                            f"校准数据已保存（{len(self.samples)} 个样本）")
+        messagebox.showinfo("已保存", f"校准数据已保存（{len(self.samples)} 个样本）")
 
     def save_and_close(self):
         if len(self.samples) >= 2:
@@ -541,19 +447,13 @@ class CalibrationWindow(tk.Toplevel):
         h = self.curve_canvas.winfo_height() or 260
         draw_calibration_curve(
             self.curve_canvas, self.samples, w, h,
-            current_env=(
-                self._current_env if hasattr(self, '_current_env')
-                else None),
+            current_env=self._current_env if hasattr(self, '_current_env') else None,
             current_target=None,
-            current_screen=(
-                self._current_screen if hasattr(self, '_current_screen')
-                else None),
+            current_screen=self._current_screen if hasattr(self, '_current_screen') else None,
         )
 
     def on_close(self):
         self._running = False
-        if self.cap:
-            self.cap.release()
         self.app._calibration_window = None
         self.destroy()
 
@@ -621,6 +521,10 @@ class AutoBrightnessApp:
 
         # 日志
         self._log_lines = []
+
+        # === 摄像头管理器（应用生命周期内只开一次） ===
+        self.cam = CameraManager()
+        self.cam.start()
 
         # === 构建界面 ===
         self._setup_styles()
@@ -869,7 +773,7 @@ class AutoBrightnessApp:
             self._interval_var.get() or DEFAULT_INTERVAL)
 
         self.worker = BrightnessWorker(
-            camera_index=0,
+            self.cam,
             interval=interval,
             fast=self._fast_mode.get(),
             samples=samples,
@@ -1003,7 +907,7 @@ class AutoBrightnessApp:
         if self._calibration_window is not None:
             self._calibration_window.lift()
             return
-        self._calibration_window = CalibrationWindow(self)
+        self._calibration_window = CalibrationWindow(self, self.cam)
         self._calibration_window.protocol(
             "WM_DELETE_WINDOW", self._on_calibration_close)
 
@@ -1056,6 +960,7 @@ class AutoBrightnessApp:
             self.stop()
         if self._calibration_window:
             self._calibration_window.on_close()
+        self.cam.stop()
         self.root.destroy()
 
 
