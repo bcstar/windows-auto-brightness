@@ -292,9 +292,9 @@ def draw_calibration_curve(canvas, samples, width, height,
 class CalibrationWindow(tk.Toplevel):
     """GUI 校准窗口——替代 OpenCV 窗口的校准体验"""
 
-    def __init__(self, parent, camera_index=0):
-        super().__init__(parent)
-        self.parent = parent
+    def __init__(self, app, camera_index=0):
+        super().__init__(app.root)
+        self.app = app
         self.camera_index = camera_index
         # 加载已有校准数据作为起点（累计，不覆盖）
         calib = load_calibration()
@@ -528,7 +528,7 @@ class CalibrationWindow(tk.Toplevel):
         self._running = False
         if self.cap:
             self.cap.release()
-        self.parent._calibration_window = None
+        self.app._calibration_window = None
         self.destroy()
 
 
@@ -975,7 +975,7 @@ class AutoBrightnessApp:
         if self._calibration_window is not None:
             self._calibration_window.lift()
             return
-        self._calibration_window = CalibrationWindow(self.root)
+        self._calibration_window = CalibrationWindow(self)
         self._calibration_window.protocol(
             "WM_DELETE_WINDOW", self._on_calibration_close)
 
