@@ -58,6 +58,13 @@ class BrightnessWorker(threading.Thread):
         self.cap = None
 
     def run(self):
+        # 初始化 COM 以便在工作线程中使用 WMI
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except ImportError:
+            pass
+
         self.cap = open_camera(self.camera_index)
         if not self.cap or not self.cap.isOpened():
             self.data_queue.put({"type": "error", "msg": "无法打开摄像头"})
@@ -142,11 +149,11 @@ class BrightnessWorker(threading.Thread):
                 except queue.Full:
                     pass
 
-            # 休眠分段检测
-            for _ in range(5):
+            # 休眠分段检测（PS 时代睡 500ms，现在 COM 瞬发可缩到 100ms）
+            for _ in range(2):
                 if self._stop_event.is_set():
                     break
-                time.sleep(0.1)
+                time.sleep(0.05)
 
         # 清理
         if self.cap:
