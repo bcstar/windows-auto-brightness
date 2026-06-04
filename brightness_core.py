@@ -185,8 +185,8 @@ def get_calibration_samples():
 
 
 def open_camera(index=0):
-    """打开摄像头并返回 VideoCapture 对象"""
-    cap = cv2.VideoCapture(index)
+    """打开摄像头（DirectShow 后端，比默认 MSMF 快 ~1s）"""
+    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
     return cap

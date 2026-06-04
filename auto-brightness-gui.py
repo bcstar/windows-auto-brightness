@@ -404,20 +404,46 @@ class CalibrationWindow(tk.Toplevel):
         # 在列表框中显示已有样本
         self._populate_samples_list()
 
-        # 启动摄像头
-        self.start_camera()
-        self.after(100, self.poll_camera)
+        # 异步打开摄像头（不阻塞 UI 线程）
+        self.after(100, self._init_camera_async)
         self.after(500, self.redraw_curve)
 
-    def start_camera(self):
-        self.cap = open_camera(self.camera_index)
-        if not self.cap or not self.cap.isOpened():
-            messagebox.showerror("错误", "无法打开摄像头")
-            self._running = False
+    def _init_camera_async(self):
+        """在后台线程打开摄像头，初始化完成后切回主线程"""
+        import threading
+
+        self.preview_label.config(text="⏳ 正在打开摄像头...")
+
+        def _open():
+            try:
+                cap = open_camera(self.camera_index)
+                if cap and cap.isOpened():
+                    for _ in range(10):
+                        cap.read()
+                    time.sleep(0.3)
+                    self.after(0, lambda: self._on_camera_ready(cap))
+                else:
+                    self.after(0, lambda: self._on_camera_failed())
+            except Exception as e:
+                self.after(0, lambda: self._on_camera_failed(str(e)))
+
+        threading.Thread(target=_open, daemon=True).start()
+
+    def _on_camera_ready(self, cap):
+        """摄像头已就绪，启动采集循环"""
+        if not self._running:
+            cap.release()
             return
-        for _ in range(10):
-            self.cap.read()
-        time.sleep(0.3)
+        self.cap = cap
+        self.after(150, self.poll_camera)
+
+    def _on_camera_failed(self, msg=""):
+        """摄像头打开失败"""
+        self._running = False
+        if not self.winfo_exists():
+            return
+        self.preview_label.config(text="❌ 无法打开摄像头")
+        messagebox.showerror("错误", f"无法打开摄像头\n{msg}")
 
     def poll_camera(self):
         if not self._running:
@@ -852,14 +878,13 @@ class AutoBrightnessApp:
         self.worker.start()
         self._running = True
 
-        # 更新 UI
+        # 先显示「启动中」，等 worker 摄像头就绪后改为「运行中」
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
-        self.status_icon.config(text=ICON_RUNNING)
-        self.status_label.config(text="运行中")
-        self.status_detail.config(text=f"间隔 {interval}s")
-
-        self.log("自动亮度已启动")
+        self.status_icon.config(text="⏳")
+        self.status_label.config(text="启动中...")
+        self.status_detail.config(text="正在打开摄像头")
+        self.log("正在启动...")
 
     def stop(self):
         if self.worker and self._running:
@@ -923,7 +948,10 @@ class AutoBrightnessApp:
             self.log(f"❌ 错误: {data.get('msg', '未知')}", "error")
 
         elif dt == "started":
-            pass
+            self.status_icon.config(text=ICON_RUNNING)
+            self.status_label.config(text="运行中")
+            self.status_detail.config(text="初始采样中...")
+            self.log("摄像头已就绪")
 
         elif dt == "stopped":
             self.stop()
